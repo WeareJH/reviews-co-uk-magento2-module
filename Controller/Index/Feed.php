@@ -2,110 +2,30 @@
 
 namespace Reviewscouk\Reviews\Controller\Index;
 
-use Magento\Framework as Framework;
-use Magento\Catalog as Catalog;
-use Magento\CatalogInventory as CatalogInventory;
-use Magento\Store as Store;
-use Reviewscouk\Reviews as Reviews;
-use Magento\Framework\App\Action\HttpGetActionInterface as HttpGetActionInterface;
-use Magento\Framework\App\Action\HttpPostActionInterface as HttpPostActionInterface;
-use Magento\Framework\Cache\Core;
-use Magento\Catalog\Model\Product;
-use Magento\CatalogInventory\Api\StockRegistryInterface;
 use Magento\Catalog\Helper\Image;
+use Magento\Catalog\Model\Product;
+use Magento\Catalog\Model\ResourceModel\Product\CollectionFactory;
+use Magento\CatalogInventory\Api\StockRegistryInterface;
+use Magento\ConfigurableProduct\Model\Product\Type\Configurable;
+use Magento\Framework\App\Action\HttpGetActionInterface;
+use Magento\Framework\App\ObjectManager;
+use Magento\Framework\Controller\ResultFactory;
+use Magento\GroupedProduct\Model\Product\Type\Grouped;
 use Magento\Store\Model\StoreManagerInterface;
 use Reviewscouk\Reviews\Helper\Config;
-use Magento\Catalog\Model\ResourceModel\Product\CollectionFactory;
-use Magento\ConfigurableProduct\Model\Product\Type\Configurable;
-use Magento\Framework\HTTP\Client\Curl;
-use Magento\Framework\Controller\ResultFactory;
 
 class Feed implements HttpGetActionInterface
 {
-    protected $configHelper;
-    protected $cache;
-    protected $productModel;
-    protected $stockModel;
-    protected $imageHelper;
-    protected $storeModel;
-    protected $productCollectionFactory;
-    protected $configurableType;
-    protected $curl;
-    protected $resultFactory;
-
     public function __construct(
-        //Framework\App\Action\Context $context,
-        Core $core,
-        Product $product,
-        StockRegistryInterface $stockRegistryInterface,
-        Image $image,
-        StoreManagerInterface $storeManagerInterface,
-        Config $config,
-        CollectionFactory $productCollectionFactory,
-        Configurable $configurableType,
-        Curl $curl,
-        ResultFactory $resultFactory
+        private readonly StockRegistryInterface $stockRegistry,
+        private readonly Image $image,
+        private readonly StoreManagerInterface $storeManager,
+        private readonly Config $config,
+        private readonly CollectionFactory $productCollectionFactory,
+        private readonly Configurable $configurableType,
+        private readonly ResultFactory $resultFactory,
+        private readonly Grouped $groupedType
     ) {
-        // parent::__construct($context);
-
-        $this->configHelper = $config;
-        $this->cache = $core;
-        $this->productModel = $product;
-        $this->stockModel = $stockRegistryInterface;
-        $this->imageHelper = $image;
-        $this->storeModel = $storeManagerInterface;
-        $this->productCollectionFactory = $productCollectionFactory;
-        $this->configurableType = $configurableType;
-        $this->curl = $curl;
-        $this->resultFactory = $resultFactory;
-    }
-
-    private function getProductCollection()
-    {
-        $collection = $this->productCollectionFactory->create();
-        /* Addtional */
-        $collection
-            ->addMinimalPrice()
-            ->addFinalPrice()
-            ->addTaxPercents()
-            ->addAttributeToSelect('*')
-            ->addUrlRewrite();
-        return $collection;
-    }
-
-    private function validateImageUrl($imageUrl)
-    {
-        $options = [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HEADER => true,
-            CURLOPT_NOBODY => true,
-        ];
-
-        if (strpos($imageUrl, "Magento_Catalog/images/product/placeholder/image.jpg") !== false) {
-            return false;
-        }
-
-        return true;
-    }
-
-    private function validateVariantUrl($url)
-    {
-        $options = [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HEADER => true,
-            CURLOPT_NOBODY => true,
-        ];
-
-        try {
-            $this->curl->get($url);
-            $this->curl->setOptions($options);
-
-            if ($this->curl->getStatus() == 200) {
-                return true;
-            }
-        } catch (\Exception $e) {
-            return false;
-        }
     }
 
     public function execute()
@@ -114,9 +34,9 @@ class Feed implements HttpGetActionInterface
         ob_start();
         set_time_limit(0);
 
-        $store = $this->storeModel->getStore();
+        $store = $this->storeManager->getStore();
 
-        $productFeedEnabled = $this->configHelper->isProductFeedEnabled($store->getId());
+        $productFeedEnabled = $this->config->isProductFeedEnabled($store->getId());
         if ($productFeedEnabled) {
             // TODO:- Implement caching of Feed
             $productFeed = "<?xml version='1.0'?>
@@ -128,20 +48,14 @@ class Feed implements HttpGetActionInterface
             $products = $this->getProductCollection();
 
             foreach ($products as $product) {
-                $parentProductId = null;
                 $groupedParentId = null;
                 $configurableParentId = null;
-                $objectManager = \Magento\Framework\App\ObjectManager::getInstance();
+                $objectManager = ObjectManager::getInstance();
 
-                if ($objectManager->create('Magento\GroupedProduct\Model\Product\Type\Grouped')->getParentIdsByChild($product->getId())) {
-                    $groupedParentId = $objectManager->create('Magento\GroupedProduct\Model\Product\Type\Grouped')->getParentIdsByChild($product->getId());
-                }
-                if ($objectManager->create('Magento\ConfigurableProduct\Model\ResourceModel\Product\Type\Configurable')->getParentIdsByChild($product->getId())) {
-                    $configurableParentId = $objectManager->create('Magento\ConfigurableProduct\Model\ResourceModel\Product\Type\Configurable')->getParentIdsByChild($product->getId());
-                }
+                $groupedParentId = $this->groupedType->getParentIdsByChild($product->getId());
+                $configurableParentId = $this->configurableType->getParentIdsByChild($product->getId());
 
                 $parentId = null;
-                $parentProduct = null;
 
                 if (isset($groupedParentId[0])) {
                     $parentId = $groupedParentId[0];
@@ -150,15 +64,16 @@ class Feed implements HttpGetActionInterface
                 }
 
                 // Load image url via helper.
-                $productImageUrl = $this->imageHelper->init($product, 'product_page_image_large')->getUrl();
+                $productImageUrl = $this->image->init($product, 'product_page_image_large')->getUrl();
                 $imageLink = $productImageUrl;
                 $productUrl = $product->getProductUrl();
 
                 if (isset($parentId)) {
-                    $parentProduct = $objectManager->create('Magento\Catalog\Model\Product')->load($parentId);
+                    $parentProduct = $objectManager->create(Product::class)->load($parentId);
 
-                    $parentProductImageUrl = $this->imageHelper->init($parentProduct, 'product_page_image_large')->getUrl();
+                    $parentProductImageUrl = $this->image->init($parentProduct, 'product_page_image_large')->getUrl();
                     $validVariantImage = $this->validateImageUrl($productImageUrl);
+
                     if (!$validVariantImage) {
                         $imageLink = $parentProductImageUrl;
                     }
@@ -166,7 +81,9 @@ class Feed implements HttpGetActionInterface
                     $productUrl = $parentProduct->getProductUrl();
                 }
 
-                $brand = $product->hasData('manufacturer') ? $product->getAttributeText('manufacturer') : ($product->hasData('brand') ? $product->getAttributeText('brand') : 'Not Available');
+                $brand = $product->hasData('manufacturer')
+                    ? $product->getAttributeText('manufacturer')
+                    : ($product->hasData('brand') ? $product->getAttributeText('brand') : 'Not Available');
                 $price = $product->getPrice();
                 $finalPrice = $product->getFinalPrice();
 
@@ -192,25 +109,26 @@ class Feed implements HttpGetActionInterface
                 $categoryCollection = $product->getCategoryCollection();
                 if (count($categoryCollection) > 0) {
                     foreach ($categoryCollection as $category) {
-                        $productFeed .= "<g:google_product_category><![CDATA[" . $category->getName() . "]]></g:google_product_category>";
+                        $productFeed .= '<g:google_product_category><![CDATA[' . $category->getName() . ']]></g:google_product_category>';
                     }
                 }
 
-                $stock = $this->stockModel->getStockItem(
+                $stock = $this->stockRegistry->getStockItem(
                     $product->getId(),
                     $product->getStore()->getWebsiteId()
                 );
+
                 if ($stock->getIsInStock()) {
-                    $productFeed .= "<g:availability>in stock</g:availability>";
+                    $productFeed .= '<g:availability>in stock</g:availability>';
                 } else {
-                    $productFeed .= "<g:availability>out of stock</g:availability>";
+                    $productFeed .= '<g:availability>out of stock</g:availability>';
                 }
 
-                $productFeed .= "</item>";
+                $productFeed .= '</item>';
                 $parentProduct = null;
             }
 
-            $productFeed .= "</channel></rss>";
+            $productFeed .= '</channel></rss>';
 
             // TODO:- Implement caching of feed
 
@@ -218,9 +136,29 @@ class Feed implements HttpGetActionInterface
             $result->setContents($productFeed);
 
             return $result;
-            // exit();
         } else {
-            print "Product Feed is disabled.";
+            print 'Product Feed is disabled.';
         }
+    }
+
+    private function getProductCollection()
+    {
+        $collection = $this->productCollectionFactory->create();
+        $collection
+            ->addMinimalPrice()
+            ->addFinalPrice()
+            ->addTaxPercents()
+            ->addAttributeToSelect(['name', 'manufacturer', 'gtin', 'brand', 'image', 'upc', 'mpn'])
+            ->addUrlRewrite();
+        return $collection;
+    }
+
+    private function validateImageUrl($imageUrl): bool
+    {
+        if (str_contains($imageUrl, 'Magento_Catalog/images/product/placeholder/image.jpg')) {
+            return false;
+        }
+
+        return true;
     }
 }
